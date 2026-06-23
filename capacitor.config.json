@@ -1,5 +1,11 @@
 {
   "appId": "com.shilpi.geminibookfinder",
   "appName": "Lumina",
-  "webDir": "dist"
+  "webDir": "dist",
+  "plugins": {
+    "FirebaseAuthentication": {
+      "skipNativeAuth": true,
+      "providers": ["google.com"]
+    }
+  }
 }

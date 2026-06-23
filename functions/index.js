@@ -57,6 +57,21 @@ async function recordUsageSafely(payload) {
   }
 }
 
+function getRequestIp(request) {
+  const forwardedFor = String(
+    request?.rawRequest?.headers?.['x-forwarded-for'] || ''
+  )
+    .split(',')[0]
+    .trim();
+
+  return (
+    forwardedFor ||
+    request?.rawRequest?.ip ||
+    request?.rawRequest?.socket?.remoteAddress ||
+    'Unknown IP'
+  );
+}
+
 function isGeminiQuotaError(status, result) {
   const code = String(result?.error?.status || result?.error?.code || '').toLowerCase();
   const message = String(result?.error?.message || '').toLowerCase();
@@ -131,7 +146,7 @@ function normalizeClaudeResult(result, model) {
   };
 }
 
-async function saveGlobalUsage({ auth, callType, status, result, provider, model }) {
+async function saveGlobalUsage({ auth, callType, status, result, provider, model, ipAddress }) {
   if (!auth?.uid) return;
 
   const db = admin.firestore();
@@ -152,6 +167,7 @@ async function saveGlobalUsage({ auth, callType, status, result, provider, model
     totalTokens,
     userId: auth.uid,
     userEmail,
+    ipAddress: ipAddress || 'Unknown IP',
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
@@ -171,6 +187,7 @@ async function saveGlobalUsage({ auth, callType, status, result, provider, model
         lastProvider: provider,
         lastModel: model,
         lastUserEmail: userEmail,
+        lastIpAddress: ipAddress || 'Unknown IP',
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       },
       { merge: true }
@@ -261,6 +278,7 @@ export const generateGeminiContent = onCall(
 
     const { contents, generationConfig = {}, callType = 'AI call' } =
       request.data || {};
+    const ipAddress = getRequestIp(request);
 
     if (!Array.isArray(contents) || contents.length === 0) {
       throw new HttpsError('invalid-argument', 'AI contents are required.');
@@ -276,6 +294,7 @@ export const generateGeminiContent = onCall(
         result: gemini.result,
         provider: 'gemini',
         model: GEMINI_MODEL,
+        ipAddress,
       });
       return { ...gemini.result, provider: 'gemini', model: GEMINI_MODEL };
     }
@@ -288,6 +307,7 @@ export const generateGeminiContent = onCall(
         result: gemini.result,
         provider: 'gemini',
         model: GEMINI_MODEL,
+        ipAddress,
       });
       throw new HttpsError(
         getProviderErrorCode(gemini.status),
@@ -305,6 +325,7 @@ export const generateGeminiContent = onCall(
         result: claude.result,
         provider: 'claude',
         model: claude.model || claudeModel.value(),
+        ipAddress,
       });
       throw new HttpsError(
         getProviderErrorCode(claude.status),
@@ -319,6 +340,7 @@ export const generateGeminiContent = onCall(
       result: claude.result,
       provider: 'claude',
       model: claude.model,
+      ipAddress,
     });
 
     return { ...claude.result, fallbackFrom: 'gemini-quota' };

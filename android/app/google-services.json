@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "49061491719",
+    "project_id": "lumina-kaboom",
+    "storage_bucket": "lumina-kaboom.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:49061491719:android:7e964cf6e877793e3fa6a2",
+        "android_client_info": {
+          "package_name": "com.shilpi.geminibookfinder"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "49061491719-j2h9qqbufqqmmfvfmd5kmf9l4lq3pmte.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.shilpi.geminibookfinder",
+            "certificate_hash": "6901c466cf9df921e1ddf6d07929d26796b948d8"
+          }
+        },
+        {
+          "client_id": "49061491719-jp6q6cmkreise8s8tlnim42ev9pvr10h.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB7P4GlhExxDnU0KrHjO2qZWgdjqhCnwYg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "49061491719-jp6q6cmkreise8s8tlnim42ev9pvr10h.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

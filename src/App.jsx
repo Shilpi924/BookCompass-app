@@ -1,4 +1,6 @@
 import { useCallback, useMemo, useState, useEffect, useRef } from "react";
+import { Capacitor } from "@capacitor/core";
+import { FirebaseAuthentication } from "@capacitor-firebase/authentication";
 import {
   createUserWithEmailAndPassword,
   getRedirectResult,
@@ -7,6 +9,8 @@ import {
   reload,
   sendEmailVerification,
   sendPasswordResetEmail,
+  signInAnonymously,
+  signInWithCredential,
   signInWithEmailAndPassword,
   signInWithPopup,
   signInWithRedirect,
@@ -42,17 +46,16 @@ import {
 const googleBooksApiKey = import.meta.env.GOOGLE_BOOKS_API_KEY;
 const firebaseProjectId = import.meta.env.VITE_FIREBASE_PROJECT_ID || "lumina-kaboom";
 const firestoreConsoleUrl = `https://console.firebase.google.com/project/${firebaseProjectId}/firestore/databases/-default-/data/~2Fusers`;
-const configuredGeminiDailyLimit = Number(import.meta.env.VITE_GEMINI_DAILY_LIMIT);
+const firebaseAuthConsoleUrl = `https://console.firebase.google.com/project/${firebaseProjectId}/authentication/users`;
+const isNativeApp = Capacitor.isNativePlatform();
+const isAndroidApp = Capacitor.getPlatform() === "android";
+const hasNativeFirebaseAuthentication = Capacitor.isPluginAvailable("FirebaseAuthentication");
+const isAndroidGoogleSsoConfigured =
+  import.meta.env.VITE_ANDROID_GOOGLE_SSO_READY === "true";
 const isGeminiConfigured = isFirebaseConfigured;
 const MODEL_NAME = "gemini-2.5-flash-lite";
 const GOOGLE_BOOKS_PREVIEW_TIMEOUT_MS = 10000;
 const GOOGLE_BOOKS_PREVIEW_STALE_MS = GOOGLE_BOOKS_PREVIEW_TIMEOUT_MS + 3000;
-const GEMINI_DAILY_LIMIT =
-  Number.isFinite(configuredGeminiDailyLimit) && configuredGeminiDailyLimit > 0
-    ? configuredGeminiDailyLimit
-    : 1000;
-const GEMINI_SCAN_RPM_LIMIT = 15;
-const GEMINI_SCAN_DAILY_TOKEN_LIMIT = 100000;
 const ONE_MINUTE_MS = 60 * 1000;
 const DEFAULT_FILTERS = {
   genre: "",
@@ -93,13 +96,33 @@ const DAILY_GUEST_SCAN_LIMIT = 12;
 const DAILY_USER_SCAN_LIMIT = 30;
 const DEVELOPER_EMAILS = ["shilpispin@gmail.com"];
 const DEFAULT_FOLDERS = ["Want to read", "Read aloud", "For kids", "School", "Gift ideas", "Favorites"];
-const LAUNCH_READINESS_ITEMS = [
-  "Delete account flow",
-  "Privacy policy",
-  "Terms of use",
-  "Data deletion page",
-  "AI accuracy disclaimer",
-  "Node 22 Functions upgrade",
+const NEW_FOLDER_OPTION = "__new_folder__";
+const MAX_LIBRARY_CARDS = 10;
+const MAX_LIBRARY_CARD_NAME_LENGTH = 36;
+const MAX_LIBRARY_CARD_NUMBER_LENGTH = 64;
+const SECTION_DEFAULT_OPEN = {
+  account: true,
+  libraryFolders: true,
+  savedBooks: true,
+  scanResults: true,
+};
+const CODE_128_PATTERNS = [
+  "212222", "222122", "222221", "121223", "121322", "131222", "122213",
+  "122312", "132212", "221213", "221312", "231212", "112232", "122132",
+  "122231", "113222", "123122", "123221", "223211", "221132", "221231",
+  "213212", "223112", "312131", "311222", "321122", "321221", "312212",
+  "322112", "322211", "212123", "212321", "232121", "111323", "131123",
+  "131321", "112313", "132113", "132311", "211313", "231113", "231311",
+  "112133", "112331", "132131", "113123", "113321", "133121", "313121",
+  "211331", "231131", "213113", "213311", "213131", "311123", "311321",
+  "331121", "312113", "312311", "332111", "314111", "221411", "431111",
+  "111224", "111422", "121124", "121421", "141122", "141221", "112214",
+  "112412", "122114", "122411", "142112", "142211", "241211", "221114",
+  "413111", "241112", "134111", "111242", "121142", "121241", "114212",
+  "124112", "124211", "411212", "421112", "421211", "212141", "214121",
+  "412121", "111143", "111341", "131141", "114113", "114311", "411113",
+  "411311", "113141", "114131", "311141", "411131", "211412", "211214",
+  "211232", "2331112",
 ];
 
 function normalizeFilters(filters) {
@@ -128,6 +151,10 @@ function isValidEmail(email) {
 
 function hasDeveloperAccess(user) {
   return DEVELOPER_EMAILS.includes(String(user?.email || "").toLowerCase());
+}
+
+function isSyncUser(user) {
+  return Boolean(user?.uid && !user.isAnonymous);
 }
 
 function sanitizeDisplayName(name) {
@@ -402,6 +429,13 @@ function getFriendlyScanError(error) {
   if (lowerMessage.includes("api key") || lowerMessage.includes("key not valid")) {
     return "Gemini is not configured on the server. Check the Firebase Function secret.";
   }
+  if (
+    code.includes("admin-restricted-operation") ||
+    lowerMessage.includes("admin-restricted-operation") ||
+    lowerMessage.includes("operation is restricted")
+  ) {
+    return "Guest scanning needs Anonymous sign-in enabled in Firebase Authentication. Open Firebase Console > Authentication > Sign-in method, then enable Anonymous.";
+  }
   if (lowerMessage.includes("quota") || lowerMessage.includes("rate limit") || code.includes("resource-exhausted")) {
     return "Gemini quota or rate limit was reached. Lumina will try Claude fallback when Gemini reports quota exhaustion.";
   }
@@ -453,6 +487,24 @@ function safeParseJson(text) {
 
 function getBookKey(book) {
   return `${book?.title || ""}-${book?.author || ""}`.toLowerCase();
+}
+
+function mergeUniqueByKey(primary = [], secondary = [], getKey = (item) => item?.id) {
+  const merged = [];
+  const seen = new Set();
+
+  [...primary, ...secondary].forEach((item) => {
+    const key = getKey(item);
+    if (!item || !key || seen.has(key)) return;
+    seen.add(key);
+    merged.push(item);
+  });
+
+  return merged;
+}
+
+function hasActiveFilters(filters) {
+  return Object.values(filters || {}).some(Boolean);
 }
 
 function normalizeBookText(text) {
@@ -656,6 +708,112 @@ function normalizeSavedFiles(files) {
   });
 
   return [...savedById.values()];
+}
+
+function sanitizeLibraryCardName(name) {
+  return String(name || "")
+    .replace(/<[^>]*>/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_LIBRARY_CARD_NAME_LENGTH);
+}
+
+function sanitizeLibraryCardNumber(number) {
+  return String(number || "")
+    .replace(/[^\x20-\x7e]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_LIBRARY_CARD_NUMBER_LENGTH);
+}
+
+function normalizeLibraryCard(card) {
+  const cardNumber = sanitizeLibraryCardNumber(card?.cardNumber);
+  const normalizedCardNumber = normalizeBookText(cardNumber).replace(/\s+/g, "-");
+  const fallbackId = normalizedCardNumber
+    ? `library-card-${normalizedCardNumber}`
+    : `library-card-${Date.now()}`;
+
+  return {
+    id: card?.id || fallbackId,
+    name: sanitizeLibraryCardName(card?.name) || "Library card",
+    cardNumber,
+    barcodeFormat: card?.barcodeFormat || "CODE_128",
+    imageDataUrl:
+      typeof card?.imageDataUrl === "string" && card.imageDataUrl.startsWith("data:image/")
+        ? card.imageDataUrl
+        : "",
+    imageName: sanitizeLibraryCardName(card?.imageName) || "",
+    addedAt: card?.addedAt || new Date().toISOString(),
+  };
+}
+
+function normalizeLibraryCards(cards) {
+  const cardsById = new Map();
+
+  (Array.isArray(cards) ? cards : [])
+    .map(normalizeLibraryCard)
+    .filter((card) => card.cardNumber)
+    .forEach((card) => {
+      if (!cardsById.has(card.id)) cardsById.set(card.id, card);
+    });
+
+  return [...cardsById.values()]
+    .sort((a, b) => new Date(b.addedAt).getTime() - new Date(a.addedAt).getTime())
+    .slice(0, MAX_LIBRARY_CARDS);
+}
+
+function getCode128Pattern(value) {
+  const text = sanitizeLibraryCardNumber(value);
+  if (!text) return "";
+
+  const values = [104];
+  for (const character of text) {
+    const code = character.charCodeAt(0);
+    values.push(code >= 32 && code <= 126 ? code - 32 : 0);
+  }
+
+  const checksum =
+    values[0] + values.slice(1).reduce((sum, code, index) => sum + code * (index + 1), 0);
+  values.push(checksum % 103, 106);
+
+  return values.map((code) => CODE_128_PATTERNS[code]).join("");
+}
+
+function getCode128Bars(value) {
+  const pattern = getCode128Pattern(value);
+  let x = 0;
+  const bars = [];
+
+  pattern.split("").forEach((widthText, index) => {
+    const width = Number(widthText);
+    if (index % 2 === 0) bars.push({ x, width });
+    x += width;
+  });
+
+  return { bars, width: x };
+}
+
+function getImageDataUrl(file, maxWidth = 700) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      const image = new Image();
+      image.onload = () => {
+        const scale = Math.min(1, maxWidth / Math.max(1, image.width));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        const context = canvas.getContext("2d");
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.74));
+      };
+      image.onerror = reject;
+      image.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
 }
 
 function getSavedBookGroups(files) {
@@ -1078,9 +1236,7 @@ export default function App() {
   const [imagePreview, setImagePreview] = useState(null);
   const [books, setBooks] = useState([]);
   const [search, setSearch] = useState("");
-  const [filters, setFilters] = useState(() =>
-    normalizeFilters(readStoredJson("bookSearchFilters", DEFAULT_FILTERS))
-  );
+  const [filters, setFilters] = useState(() => normalizeFilters(DEFAULT_FILTERS));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [currentPage, setCurrentPage] = useState("scan");
@@ -1115,6 +1271,7 @@ export default function App() {
     lastModel: "",
     lastUserEmail: "",
   });
+  const [developerIpUsage, setDeveloperIpUsage] = useState([]);
   const [developerStatsStatus, setDeveloperStatsStatus] = useState(
     isFirebaseConfigured ? "Loading Firebase stats..." : "Firebase is not configured yet."
   );
@@ -1125,30 +1282,44 @@ export default function App() {
   });
 
   const [selectedBook, setSelectedBook] = useState(null);
-  const [scanHistory, setScanHistory] = useState(() => readStoredJson("scanHistory", []));
-  const [folders, setFolders] = useState(() => readStoredJson("bookFoldersList", DEFAULT_FOLDERS));
-  const [bookFolders, setBookFolders] = useState(() => readStoredJson("bookFolderAssignments", {}));
+  const [scanHistory, setScanHistory] = useState([]);
+  const [folders, setFolders] = useState(DEFAULT_FOLDERS);
+  const [bookFolders, setBookFolders] = useState({});
   const [activeFolder, setActiveFolder] = useState("All");
   const [compare, setCompare] = useState([]);
   const [compareOpen, setCompareOpen] = useState(false);
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("");
   const [geminiUsage, setGeminiUsage] = useState(getInitialGeminiUsage);
-  const [devQuotaOpen, setDevQuotaOpen] = useState(false);
-  const [activeGeminiCalls, setActiveGeminiCalls] = useState(0);
   const [previewCache, setPreviewCache] = useState({});
   const [previewModal, setPreviewModal] = useState(null);
+  const [selectedLibraryCard, setSelectedLibraryCard] = useState(null);
   const previewCacheRef = useRef({});
   const previewRequestId = useRef(0);
   const [saveStatus, setSaveStatus] = useState(null);
   const [idleBursts, setIdleBursts] = useState([]);
   const [savedArtActive, setSavedArtActive] = useState(false);
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [voiceListening, setVoiceListening] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState("");
   const recognitionRef = useRef(null);
+  const filterSearchRef = useRef(null);
+  const libraryCardScanInputRef = useRef(null);
   const [savedFiles, setSavedFiles] = useState(() => {
     return normalizeSavedFiles(readStoredJson("savedPreviewFiles", []));
   });
+  const [libraryCards, setLibraryCards] = useState([]);
+  const [libraryCardForm, setLibraryCardForm] = useState({
+    name: "",
+    cardNumber: "",
+    imageDataUrl: "",
+    imageName: "",
+  });
+  const [libraryCardMessage, setLibraryCardMessage] = useState("");
+  const [openSections, setOpenSections] = useState(() => ({
+    ...SECTION_DEFAULT_OPEN,
+    ...readStoredJson("openSections", {}),
+  }));
   const savedFileIdsRef = useRef(new Set(savedFiles.map((file) => file.id)));
   const localUserStateRef = useRef({
     readingList,
@@ -1159,6 +1330,7 @@ export default function App() {
     scanHistory,
     folders,
     bookFolders,
+    libraryCards,
   });
 
   useEffect(() => {
@@ -1175,20 +1347,19 @@ export default function App() {
   }, [geminiUsage]);
 
   useEffect(() => {
-    localStorage.setItem("bookSearchFilters", JSON.stringify(filters));
-  }, [filters]);
+    localStorage.setItem("openSections", JSON.stringify(openSections));
+  }, [openSections]);
 
   useEffect(() => {
-    localStorage.setItem("scanHistory", JSON.stringify(scanHistory));
-  }, [scanHistory]);
+    if (!authLoading) return undefined;
 
-  useEffect(() => {
-    localStorage.setItem("bookFoldersList", JSON.stringify(folders));
-  }, [folders]);
+    const authTimeout = window.setTimeout(() => {
+      setAuthLoading(false);
+      setAuthMessage("Sign-in is taking too long. Try Google again, or use email login.");
+    }, 20000);
 
-  useEffect(() => {
-    localStorage.setItem("bookFolderAssignments", JSON.stringify(bookFolders));
-  }, [bookFolders]);
+    return () => window.clearTimeout(authTimeout);
+  }, [authLoading]);
 
   useEffect(() => {
     localUserStateRef.current = {
@@ -1197,8 +1368,12 @@ export default function App() {
       filters,
       books,
       geminiUsage,
+      scanHistory,
+      folders,
+      bookFolders,
+      libraryCards,
     };
-  }, [readingList, savedFiles, filters, books, geminiUsage, scanHistory, folders, bookFolders]);
+  }, [readingList, savedFiles, filters, books, geminiUsage, scanHistory, folders, bookFolders, libraryCards]);
 
   useEffect(() => {
     if (!auth || !db) {
@@ -1210,6 +1385,10 @@ export default function App() {
       userDataLoadedRef.current = false;
 
       if (!firebaseUser) return;
+      if (firebaseUser.isAnonymous) {
+        userDataLoadedRef.current = true;
+        return;
+      }
 
       try {
         const userRef = doc(db, "users", firebaseUser.uid);
@@ -1231,15 +1410,52 @@ export default function App() {
           : null;
 
         if (cloudState) {
-          setReadingList(
-            Array.isArray(cloudState.readingList) ? cloudState.readingList : []
+          const localState = localUserStateRef.current;
+          const cloudFilters = normalizeFilters(cloudState.filters);
+          const localFilters = normalizeFilters(localState.filters);
+          const mergedReadingList = mergeUniqueByKey(
+            localState.readingList,
+            Array.isArray(cloudState.readingList) ? cloudState.readingList : [],
+            getBookKey
           );
-          setSavedFiles(normalizeSavedFiles(cloudState.savedFiles || []));
-          setFilters(normalizeFilters(cloudState.filters));
-          setBooks(Array.isArray(cloudState.books) ? cloudState.books.map(enrichScannedBook) : []);
-          setScanHistory(Array.isArray(cloudState.scanHistory) ? cloudState.scanHistory : []);
-          setFolders(Array.isArray(cloudState.folders) && cloudState.folders.length ? cloudState.folders : DEFAULT_FOLDERS);
-          setBookFolders(cloudState.bookFolders && typeof cloudState.bookFolders === "object" ? cloudState.bookFolders : {});
+          const mergedSavedFiles = mergeUniqueByKey(
+            normalizeSavedFiles(localState.savedFiles || []),
+            normalizeSavedFiles(cloudState.savedFiles || []),
+            (file) => file.id
+          );
+          const mergedBooks = mergeUniqueByKey(
+            Array.isArray(localState.books) ? localState.books.map(enrichScannedBook) : [],
+            Array.isArray(cloudState.books) ? cloudState.books.map(enrichScannedBook) : [],
+            getBookKey
+          );
+          const mergedScanHistory = mergeUniqueByKey(
+            Array.isArray(localState.scanHistory) ? localState.scanHistory : [],
+            Array.isArray(cloudState.scanHistory) ? cloudState.scanHistory : [],
+            (scan) => scan.id
+          ).slice(0, 30);
+          const mergedFolders = mergeUniqueByKey(
+            Array.isArray(localState.folders) ? localState.folders : [],
+            Array.isArray(cloudState.folders) ? cloudState.folders : [],
+            (folder) => folder
+          );
+          const mergedBookFolders = {
+            ...(cloudState.bookFolders && typeof cloudState.bookFolders === "object" ? cloudState.bookFolders : {}),
+            ...(localState.bookFolders && typeof localState.bookFolders === "object" ? localState.bookFolders : {}),
+          };
+          const mergedLibraryCards = mergeUniqueByKey(
+            normalizeLibraryCards(localState.libraryCards || []),
+            normalizeLibraryCards(cloudState.libraryCards || []),
+            (card) => card.id
+          ).slice(0, MAX_LIBRARY_CARDS);
+
+          setReadingList(mergedReadingList);
+          setSavedFiles(mergedSavedFiles);
+          setFilters(hasActiveFilters(localFilters) ? localFilters : cloudFilters);
+          setBooks(mergedBooks);
+          setScanHistory(mergedScanHistory);
+          setFolders(mergedFolders.length ? mergedFolders : DEFAULT_FOLDERS);
+          setBookFolders(mergedBookFolders);
+          setLibraryCards(mergedLibraryCards);
           setGeminiUsage(
             mergeGeminiUsage(
               cloudState.geminiUsage,
@@ -1286,7 +1502,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!user?.uid || !userDataLoadedRef.current) {
+    if (!isSyncUser(user) || !userDataLoadedRef.current) {
       return undefined;
     }
 
@@ -1300,13 +1516,14 @@ export default function App() {
         scanHistory,
         folders,
         bookFolders,
+        libraryCards,
       }).catch((err) => {
         console.error("Could not save user app data:", err);
       });
     }, 500);
 
     return () => window.clearTimeout(saveTimer);
-  }, [user, readingList, savedFiles, filters, books, geminiUsage, scanHistory, folders, bookFolders]);
+  }, [user, readingList, savedFiles, filters, books, geminiUsage, scanHistory, folders, bookFolders, libraryCards]);
 
   useEffect(() => {
     if (!db || !hasDeveloperAccess(user)) {
@@ -1350,7 +1567,7 @@ export default function App() {
             ? new Date(lastLogin.createdAtMs).toISOString()
             : "",
         });
-        setDeveloperStatsStatus("Showing Firebase login analytics from recent auth events.");
+        setDeveloperStatsStatus("");
       } catch (err) {
         console.error("Could not load developer stats:", err);
         if (!cancelled) {
@@ -1440,11 +1657,34 @@ export default function App() {
             failedCalls: 0,
           }
         );
+        const ipUsageByAddress = new Map();
+
+        snapshot.docs.forEach((eventDoc) => {
+          const eventData = eventDoc.data();
+          const ipAddress = eventData.ipAddress || "Unknown IP";
+          const totalTokens = Number(
+            eventData.totalTokens || eventData.promptTokens || 0
+          );
+          const currentUsage = ipUsageByAddress.get(ipAddress) || {
+            ipAddress,
+            apiCalls: 0,
+            totalTokens: 0,
+          };
+
+          currentUsage.apiCalls += 1;
+          currentUsage.totalTokens += totalTokens;
+          ipUsageByAddress.set(ipAddress, currentUsage);
+        });
 
         setDeveloperUsage((currentUsage) => ({
           ...currentUsage,
           ...eventTotals,
         }));
+        setDeveloperIpUsage(
+          [...ipUsageByAddress.values()]
+            .sort((a, b) => b.totalTokens - a.totalTokens)
+            .slice(0, 8)
+        );
       },
       (err) => {
         console.error("Could not load developer API usage events:", err);
@@ -1487,7 +1727,6 @@ export default function App() {
         lastUpdatedAt: now,
       };
     });
-    setActiveGeminiCalls((currentCount) => currentCount + 1);
   }
 
   function finishGeminiCall(callType, status, tokenCount = 0) {
@@ -1516,7 +1755,35 @@ export default function App() {
       lastType: callType,
       lastUpdatedAt: now,
     }));
-    setActiveGeminiCalls((currentCount) => Math.max(0, currentCount - 1));
+  }
+
+  function handleScanPickerClick(event) {
+    if (isFirebaseConfigured) return;
+
+    event.preventDefault();
+    setError("Firebase is not configured yet.");
+  }
+
+  async function ensureScanAuth() {
+    if (!auth) {
+      throw new Error("Firebase Authentication is not configured.");
+    }
+    if (auth.currentUser?.uid) {
+      return auth.currentUser;
+    }
+
+    try {
+      const credential = await signInAnonymously(auth);
+      return credential.user;
+    } catch (err) {
+      if (String(err?.code || "").includes("admin-restricted-operation")) {
+        throw new Error(
+          "Guest scanning needs Anonymous sign-in enabled in Firebase Authentication. Open Firebase Console > Authentication > Sign-in method, then enable Anonymous.",
+          { cause: err }
+        );
+      }
+      throw err;
+    }
   }
 
   function updateAuthForm(field, value) {
@@ -1641,7 +1908,15 @@ export default function App() {
     setAuthLoading(true);
     setAuthMessage("");
 
-    try {
+    if (isAndroidApp && !isAndroidGoogleSsoConfigured) {
+      setAuthLoading(false);
+      setAuthMessage(
+        "Google SSO needs the Android Firebase config. Add android/app/google-services.json, set VITE_ANDROID_GOOGLE_SSO_READY=true, rebuild, then try again."
+      );
+      return;
+    }
+
+    async function signInWithGoogleWeb() {
       const provider = new GoogleAuthProvider();
       provider.setCustomParameters({
         prompt: "select_account",
@@ -1651,21 +1926,91 @@ export default function App() {
       logEvent(analytics, "login", { method: "google" });
       setAuthMessage("Signed in with Google.");
       setCurrentPage("scan");
+    }
+
+    async function redirectToGoogleSignIn() {
+      setAuthMessage("Opening Google sign-in in this tab...");
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({
+        prompt: "select_account",
+      });
+      await signInWithRedirect(auth, provider);
+    }
+
+    try {
+      if (isNativeApp && hasNativeFirebaseAuthentication) {
+        const nativeResult = await FirebaseAuthentication.signInWithGoogle({
+          skipNativeAuth: true,
+        });
+        const idToken = nativeResult.credential?.idToken || null;
+        const accessToken = nativeResult.credential?.accessToken || undefined;
+
+        if (!idToken && !accessToken) {
+          throw new Error(
+            "Google sign-in did not return a Firebase credential. Check the Android Firebase client setup."
+          );
+        }
+
+        const googleCredential = GoogleAuthProvider.credential(idToken, accessToken);
+        const credential = await signInWithCredential(auth, googleCredential);
+
+        await recordSuccessfulLogin(credential.user, "google");
+        logEvent(analytics, "login", { method: "google-native" });
+        setAuthMessage("Signed in with Google.");
+        setCurrentPage("scan");
+        return;
+      }
+
+      if (!isNativeApp) {
+        await signInWithGoogleWeb();
+        return;
+      }
+
+      setAuthMessage(
+        "Google SSO must use native sign-in in the phone app. Add android/app/google-services.json, set VITE_ANDROID_GOOGLE_SSO_READY=true, rebuild, then try again."
+      );
     } catch (err) {
       console.error("Google sign-in failed:", err);
       const code = err?.code || "";
+      const message = String(err?.message || "");
+      if (
+        message.includes("FirebaseAuthentication") &&
+        message.includes("not implemented")
+      ) {
+        if (isAndroidApp) {
+          setAuthMessage(
+            "Google SSO needs the Android Firebase config. Add android/app/google-services.json, set VITE_ANDROID_GOOGLE_SSO_READY=true, rebuild, then try again."
+          );
+          return;
+        }
+
+        try {
+          await signInWithGoogleWeb();
+          return;
+        } catch (fallbackErr) {
+          console.error("Google web fallback sign-in failed:", fallbackErr);
+          if (String(fallbackErr?.code || "").includes("popup")) {
+            await redirectToGoogleSignIn();
+            return;
+          }
+          setAuthMessage(getAuthErrorMessage(fallbackErr));
+          return;
+        }
+      }
       if (
         code.includes("popup-blocked") ||
         code.includes("popup-closed-by-user") ||
         code.includes("cancelled-popup-request") ||
         code.includes("web-storage-unsupported")
       ) {
-        setAuthMessage("Opening Google sign-in in this tab...");
-        const provider = new GoogleAuthProvider();
-        provider.setCustomParameters({
-          prompt: "select_account",
-        });
-        await signInWithRedirect(auth, provider);
+        if (isAndroidApp) {
+          setAuthMessage(
+            "Google SSO must use native Android sign-in. Add android/app/google-services.json, set VITE_ANDROID_GOOGLE_SSO_READY=true, rebuild, then try again."
+          );
+          return;
+        }
+
+        await redirectToGoogleSignIn();
         return;
       }
 
@@ -1779,19 +2124,188 @@ export default function App() {
     }
   }
 
+  function updateLibraryCardForm(field, value) {
+    setLibraryCardForm((currentForm) => ({
+      ...currentForm,
+      [field]: field === "name" ? sanitizeLibraryCardName(value) : sanitizeLibraryCardNumber(value),
+    }));
+    setLibraryCardMessage("");
+  }
+
+  function requireLoginForLibraryCards() {
+    setAuthMode("signin");
+    setCurrentPage("account");
+    setLibraryCardMessage("Log in to add and save library cards to your account.");
+  }
+
+  function addLibraryCardFromForm(event) {
+    event.preventDefault();
+
+    if (!isSyncUser(user)) {
+      requireLoginForLibraryCards();
+      return;
+    }
+
+    if (libraryCards.length >= MAX_LIBRARY_CARDS) {
+      setLibraryCardMessage(`You can keep up to ${MAX_LIBRARY_CARDS} library cards.`);
+      return;
+    }
+
+    const cardNumber = sanitizeLibraryCardNumber(libraryCardForm.cardNumber);
+    const name = sanitizeLibraryCardName(libraryCardForm.name) || "Library card";
+
+    if (!cardNumber) {
+      setLibraryCardMessage("Enter or scan a library card barcode.");
+      return;
+    }
+
+    if (
+      libraryCards.some(
+        (card) =>
+          sanitizeLibraryCardNumber(card.cardNumber).toLowerCase() ===
+          cardNumber.toLowerCase()
+      )
+    ) {
+      setLibraryCardMessage("That library card is already saved.");
+      return;
+    }
+
+    const id =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `library-card-${Date.now()}`;
+
+    setLibraryCards((currentCards) =>
+      normalizeLibraryCards([
+        {
+          id,
+          name,
+          cardNumber,
+          barcodeFormat: "CODE_128",
+          imageDataUrl: libraryCardForm.imageDataUrl,
+          imageName: libraryCardForm.imageName,
+          addedAt: new Date().toISOString(),
+        },
+        ...currentCards,
+      ])
+    );
+    setLibraryCardForm({ name: "", cardNumber: "", imageDataUrl: "", imageName: "" });
+    setLibraryCardMessage("Library card saved.");
+  }
+
+  async function handleLibraryCardScan(file) {
+    if (!file) return;
+
+    if (!isSyncUser(user)) {
+      requireLoginForLibraryCards();
+      if (libraryCardScanInputRef.current) {
+        libraryCardScanInputRef.current.value = "";
+      }
+      return;
+    }
+
+    setLibraryCardMessage("Scanning library card photo...");
+
+    try {
+      const imageDataUrl = await getImageDataUrl(file);
+      const bitmap = await createImageBitmap(file);
+      let barcodeValue = "";
+      let detectedLibraryName = "";
+
+      if ("BarcodeDetector" in window) {
+        const detector = new window.BarcodeDetector({
+          formats: ["code_128", "code_39", "ean_13", "ean_8", "upc_a", "upc_e", "itf"],
+        });
+        const barcodes = await detector.detect(bitmap);
+        barcodeValue = sanitizeLibraryCardNumber(barcodes[0]?.rawValue || "");
+      }
+
+      bitmap.close?.();
+
+      if (isGeminiConfigured) {
+        try {
+          await ensureScanAuth();
+          const base64 = await encodeFileToBase64(file);
+          beginGeminiCall("Library card scan");
+          const result = await generateGeminiContent([
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `
+Read this library card image. Return ONLY valid JSON:
+{
+  "libraryName": "Library name visible on the card, or empty string",
+  "cardNumber": "Barcode or card number visible on the card, or empty string"
+}
+Do not include explanations.
+                  `,
+                },
+                {
+                  inlineData: {
+                    mimeType: file.type || "image/jpeg",
+                    data: base64,
+                  },
+                },
+              ],
+            },
+          ], {
+            maxOutputTokens: 512,
+            responseMimeType: "application/json",
+          }, "Library card scan");
+          const parsed = safeParseJson(getGeminiText(result));
+          detectedLibraryName = sanitizeLibraryCardName(parsed?.libraryName);
+          barcodeValue =
+            barcodeValue || sanitizeLibraryCardNumber(parsed?.cardNumber);
+          finishGeminiCall(
+            "Library card scan",
+            "Success",
+            getTotalTokenCount(result)
+          );
+        } catch (ocrErr) {
+          console.error("Library card text scan failed:", ocrErr);
+          finishGeminiCall("Library card scan", "Failed");
+        }
+      }
+
+      setLibraryCardForm((currentForm) => ({
+        ...currentForm,
+        name: detectedLibraryName || currentForm.name,
+        cardNumber: barcodeValue || currentForm.cardNumber,
+        imageDataUrl,
+        imageName: sanitizeLibraryCardName(file.name),
+      }));
+      setLibraryCardMessage(
+        barcodeValue
+          ? "Card photo saved and barcode scanned. Review, then save it."
+          : "Card photo saved. Type the barcode number if it was not detected."
+      );
+    } catch (err) {
+      console.error("Library card barcode scan failed:", err);
+      setLibraryCardMessage("Could not scan that card photo. Try again or type it.");
+    } finally {
+      if (libraryCardScanInputRef.current) {
+        libraryCardScanInputRef.current.value = "";
+      }
+    }
+  }
+
+  function deleteLibraryCard(cardId) {
+    setLibraryCards((currentCards) =>
+      currentCards.filter((card) => card.id !== cardId)
+    );
+    setLibraryCardMessage("Library card removed.");
+  }
+
   async function handleImage(file) {
     if (!file) return;
     if (!isGeminiConfigured) {
       setError("Firebase is not configured yet.");
       return;
     }
-    if (!user?.uid) {
-      setError("Sign in to scan books with Gemini.");
-      setCurrentPage("account");
-      return;
-    }
-    if (!canStartScan(user)) {
-      setError(getScanLimitMessage(user));
+    const quotaUser = isSyncUser(user) ? user : null;
+    if (!canStartScan(quotaUser)) {
+      setError(getScanLimitMessage(quotaUser));
       return;
     }
 
@@ -1808,8 +2322,9 @@ export default function App() {
 
     let geminiCallStarted = false;
     try {
+      await ensureScanAuth();
       const base64 = await encodeFileToBase64(file);
-      recordLocalScanUsage(user);
+      recordLocalScanUsage(quotaUser);
       beginGeminiCall("Bookshelf scan");
       geminiCallStarted = true;
 
@@ -1894,8 +2409,8 @@ Important:
         books: scannedBooks,
       };
       setBooks(scannedBooks);
-      setScanHistory((currentHistory) => [scanEntry, ...currentHistory].slice(0, 30));
-      if (user?.uid) {
+      if (isSyncUser(user)) {
+        setScanHistory((currentHistory) => [scanEntry, ...currentHistory].slice(0, 30));
         await saveUserScan(user.uid, {
           books: scannedBooks,
           bookCount: scannedBooks.length,
@@ -1936,7 +2451,8 @@ Important:
       window.SpeechRecognition || window.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      setVoiceStatus("Voice search is not supported in this browser.");
+      filterSearchRef.current?.focus();
+      setVoiceStatus("Voice dictation is not available in this phone view. Use the keyboard microphone or type your search.");
       return;
     }
 
@@ -1970,9 +2486,10 @@ Important:
 
     recognition.onerror = (event) => {
       const blocked = event.error === "not-allowed" || event.error === "service-not-allowed";
+      filterSearchRef.current?.focus();
       setVoiceStatus(
         blocked
-          ? "Microphone permission is needed for voice search."
+          ? "Microphone permission is needed. You can also use the keyboard microphone."
           : "Voice search could not hear you. Try again."
       );
       setVoiceListening(false);
@@ -2010,6 +2527,8 @@ Important:
   function clearFilters() {
     setFilters({ ...DEFAULT_FILTERS });
     setSearch("");
+    setVoiceStatus("");
+    setFiltersOpen(false);
   }
 
   const filteredBooks = useMemo(() => {
@@ -2093,6 +2612,45 @@ Important:
       ...currentFolders,
       [bookKey]: folderName,
     }));
+  }
+
+  function createFolderForBook(book) {
+    const bookKey = getBookKey(book);
+    if (!bookKey) return;
+
+    const folderName = window.prompt("New folder name");
+    const cleanName = folderName?.trim();
+
+    if (!cleanName) return;
+
+    const existingFolder = folders.find(
+      (folder) => folder.toLowerCase() === cleanName.toLowerCase()
+    );
+    const nextFolder = existingFolder || cleanName;
+
+    if (!existingFolder) {
+      setFolders((currentFolders) => [...currentFolders, nextFolder]);
+    }
+
+    setBookFolders((currentFolders) => ({
+      ...currentFolders,
+      [bookKey]: nextFolder,
+    }));
+    setActiveFolder(nextFolder);
+    setSaveStatus({
+      message: `${book.title} moved to ${nextFolder}.`,
+      bookKey: getSavedFileKey(book.title, "favorite"),
+      type: "favorite",
+    });
+  }
+
+  function handleFolderSelect(book, folderName) {
+    if (folderName === NEW_FOLDER_OPTION) {
+      createFolderForBook(book);
+      return;
+    }
+
+    assignBookFolder(book, folderName);
   }
 
   function markBookReviewed(book) {
@@ -2535,11 +3093,6 @@ Important:
       setAnswer("Firebase is not configured yet.");
       return;
     }
-    if (!user?.uid) {
-      setAnswer("Sign in to ask the AI Librarian.");
-      setCurrentPage("account");
-      return;
-    }
     if (!question.trim()) {
       setAnswer("Please type a question first.");
       return;
@@ -2555,6 +3108,7 @@ Important:
 
     let geminiCallStarted = false;
     try {
+      await ensureScanAuth();
       beginGeminiCall("AI Librarian");
       geminiCallStarted = true;
       const result = await generateGeminiContent([
@@ -2689,7 +3243,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
               <select
                 style={styles.inlineSelect}
                 value={folderName}
-                onChange={(event) => assignBookFolder(book, event.target.value)}
+                onChange={(event) => handleFolderSelect(book, event.target.value)}
                 aria-label="Book folder"
               >
                 {folders.map((folder) => (
@@ -2697,6 +3251,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                     {folder}
                   </option>
                 ))}
+                <option value={NEW_FOLDER_OPTION}>Add new folder...</option>
               </select>
 
               <button style={styles.smallButton} onClick={() => markBookReviewed(book)}>
@@ -2738,20 +3293,35 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
     return (
       <section style={styles.filterPanel}>
         <div style={styles.filterHeader}>
-          <h2 style={styles.filterTitle}>Filters</h2>
           <button
             type="button"
-            style={styles.clearFilterButton}
-            onClick={clearFilters}
-            disabled={activeFilterCount === 0}
+            style={styles.filterTitleButton}
+            onClick={() => setFiltersOpen((isOpen) => !isOpen)}
+            aria-expanded={filtersOpen}
           >
-            Clear
+            <span style={styles.filterTitle}>Filters</span>
+            <span style={styles.filterCountBadge}>{activeFilterCount}</span>
+            <span style={styles.filterChevron}>{filtersOpen ? "▲" : "▼"}</span>
           </button>
+          <div style={styles.filterHeaderActions}>
+            <button
+              type="button"
+              style={styles.clearFilterButton}
+              onClick={clearFilters}
+              disabled={activeFilterCount === 0}
+            >
+              Clear
+            </button>
+          </div>
         </div>
 
         <div style={styles.filterComposer}>
           <input
+            ref={filterSearchRef}
             style={styles.filterSearchInput}
+            type="search"
+            inputMode="search"
+            enterKeyHint="search"
             placeholder={
               voiceListening
                 ? "Listening for genre, age, rating, or level..."
@@ -2801,7 +3371,13 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
 
         {voiceStatus && <p style={styles.voiceStatus}>{voiceStatus}</p>}
 
-        <div style={styles.filterGrid}>
+        {!filtersOpen && activeFilterCount > 0 && (
+          <p style={styles.filterSummary}>
+            {activeFilterCount} active filter{activeFilterCount === 1 ? "" : "s"}
+          </p>
+        )}
+
+        {filtersOpen && <div style={styles.filterGrid}>
           <label style={styles.filterLabel}>
             <span>Genre</span>
             <input
@@ -2901,26 +3477,27 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
               ))}
             </select>
           </label>
-        </div>
+        </div>}
       </section>
     );
   }
 
   function renderLoginPage() {
     const isSignUp = authMode === "signup";
+    const accountUser = isSyncUser(user) ? user : null;
 
-    if (user) {
+    if (accountUser) {
       return (
         <section style={styles.authPanel}>
           <div style={styles.authHeader}>
             <h2 style={styles.authTitle}>Account</h2>
             <p style={styles.authSubtitle}>
-              Signed in as {getUserDisplayName(user)}
-              {user.email ? ` (${user.email})` : ""}.
+              Signed in as {getUserDisplayName(accountUser)}
+              {accountUser.email ? ` (${accountUser.email})` : ""}.
             </p>
           </div>
 
-          {!user.emailVerified && (
+          {!accountUser.emailVerified && (
             <p style={styles.authNotice}>
               Your email is not verified yet. Verify it to protect the account
               and unlock full saved-list sync.
@@ -2928,7 +3505,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           )}
 
           <div style={styles.authActionRow}>
-            {!user.emailVerified && (
+            {!accountUser.emailVerified && (
               <>
                 <button
                   type="button"
@@ -2975,7 +3552,14 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           </p>
         )}
 
-        {user && !user.emailVerified && (
+        {isAndroidApp && !isAndroidGoogleSsoConfigured && (
+          <p style={styles.authNotice}>
+            Phone Google SSO needs `android/app/google-services.json` and
+            `VITE_ANDROID_GOOGLE_SSO_READY=true` before the Android build can sign in.
+          </p>
+        )}
+
+        {accountUser && !accountUser.emailVerified && (
           <p style={styles.authNotice}>
             Your email is not verified yet. Verify it to protect the account and
             reduce spam signups.
@@ -3052,7 +3636,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           >
             Forgot password
           </button>
-          {user && !user.emailVerified && (
+          {accountUser && !accountUser.emailVerified && (
             <>
               <button
                 type="button"
@@ -3088,6 +3672,234 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
         </div>
 
         {authMessage && <p style={styles.authMessage}>{authMessage}</p>}
+      </section>
+    );
+  }
+
+  function renderBarcodeSvg(cardNumber) {
+    const { bars, width } = getCode128Bars(cardNumber);
+    const viewBoxWidth = Math.max(width + 24, 120);
+
+    if (!bars.length) return null;
+
+    return (
+      <svg
+        style={styles.libraryCardBarcode}
+        viewBox={`0 0 ${viewBoxWidth} 92`}
+        role="img"
+        aria-label="Scannable library card barcode"
+        preserveAspectRatio="none"
+      >
+        <rect x="0" y="0" width={viewBoxWidth} height="92" fill="#ffffff" />
+        {bars.map((bar, index) => (
+          <rect
+            key={`${bar.x}-${index}`}
+            x={bar.x + 12}
+            y="10"
+            width={bar.width}
+            height="58"
+            fill="#111111"
+          />
+        ))}
+        <text
+          x={viewBoxWidth / 2}
+          y="84"
+          textAnchor="middle"
+          fontFamily="ui-monospace, Consolas, monospace"
+          fontSize="8"
+          fill="#111111"
+        >
+          {cardNumber}
+        </text>
+      </svg>
+    );
+  }
+
+  function renderLibraryCards() {
+    const canUseLibraryCards = isSyncUser(user);
+    const canAddCard = libraryCards.length < MAX_LIBRARY_CARDS;
+    const visibleLibraryCards = canUseLibraryCards ? libraryCards : [];
+
+    return renderCollapsibleSection({
+      id: "libraryCards",
+      title: "Library cards",
+      meta: "",
+      defaultOpen: true,
+      style: styles.authPanel,
+      bodyStyle: styles.libraryCardBody,
+      children: (
+        <>
+          <form style={styles.libraryCardForm} onSubmit={addLibraryCardFromForm}>
+            <div style={styles.walletAddHeader}>
+              <span style={styles.walletAddIcon}>+</span>
+              <div>
+                <h3 style={styles.walletAddTitle}>Add library card</h3>
+                <p style={styles.savedFileMeta}>
+                  {canUseLibraryCards
+                    ? "Take a photo or upload the card."
+                    : "Log in to save cards to your account."}
+                </p>
+              </div>
+            </div>
+
+            <label style={styles.filterLabel}>
+              <span>Library</span>
+              <input
+                style={styles.filterControl}
+                value={libraryCardForm.name}
+                placeholder="City Library"
+                maxLength={MAX_LIBRARY_CARD_NAME_LENGTH}
+                onChange={(event) => updateLibraryCardForm("name", event.target.value)}
+                disabled={!canUseLibraryCards || !canAddCard}
+              />
+            </label>
+
+            <label style={styles.filterLabel}>
+              <span>Card barcode</span>
+              <input
+                style={styles.filterControl}
+                value={libraryCardForm.cardNumber}
+                placeholder="Scan or type card number"
+                inputMode="text"
+                maxLength={MAX_LIBRARY_CARD_NUMBER_LENGTH}
+                onChange={(event) =>
+                  updateLibraryCardForm("cardNumber", event.target.value)
+                }
+                disabled={!canUseLibraryCards || !canAddCard}
+              />
+            </label>
+
+            <div style={styles.libraryCardActions}>
+              <label
+                style={{
+                  ...styles.authSecondaryButton,
+                  ...styles.libraryCardScanButton,
+                  ...(!canUseLibraryCards || !canAddCard ? styles.disabledButton : {}),
+                }}
+                onClick={() => {
+                  if (!canUseLibraryCards) requireLoginForLibraryCards();
+                }}
+              >
+                Take card photo
+                <input
+                  ref={libraryCardScanInputRef}
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  hidden
+                  disabled={!canUseLibraryCards || !canAddCard}
+                  onChange={(event) => handleLibraryCardScan(event.target.files[0])}
+                />
+              </label>
+              <button
+                type="submit"
+                style={styles.authPrimaryButton}
+                disabled={canUseLibraryCards && !canAddCard}
+              >
+                {canUseLibraryCards ? "Add card" : "Log in to add"}
+              </button>
+            </div>
+
+            {libraryCardForm.imageDataUrl && (
+              <div style={styles.libraryCardPhotoPreview}>
+                <img
+                  src={libraryCardForm.imageDataUrl}
+                  alt="Library card preview"
+                  style={styles.libraryCardPhoto}
+                />
+              </div>
+            )}
+
+            {!canAddCard && (
+              <p style={styles.countText}>Remove a card before adding another one.</p>
+            )}
+            {libraryCardMessage && (
+              <p style={styles.authMessage}>{libraryCardMessage}</p>
+            )}
+          </form>
+
+          <div style={styles.libraryCardList}>
+            {visibleLibraryCards.length === 0 ? (
+              <p style={styles.countText}>
+                {canUseLibraryCards
+                  ? "No library cards saved yet."
+                  : "Saved cards appear here after login."}
+              </p>
+            ) : (
+              visibleLibraryCards.map((card) => (
+                <article key={card.id} style={styles.libraryCardTile}>
+                  <button
+                    type="button"
+                    style={styles.libraryCardWalletButton}
+                    onClick={() => setSelectedLibraryCard(card)}
+                    aria-label={`Open ${card.name}`}
+                  >
+                    <span style={styles.walletAccent} />
+                    <div>
+                      <p style={styles.walletEyebrow}>Library card</p>
+                      <h3 style={styles.libraryCardName}>{card.name}</h3>
+                      <p style={styles.walletMaskedNumber}>
+                        •••• {card.cardNumber.slice(-4) || "card"}
+                      </p>
+                    </div>
+                    <span style={styles.walletTapHint}>Show</span>
+                  </button>
+                  <div style={styles.libraryCardTileActions}>
+                    <button
+                      type="button"
+                      style={styles.smallButton}
+                      onClick={() => setSelectedLibraryCard(card)}
+                    >
+                      Barcode
+                    </button>
+                    <button
+                      type="button"
+                      style={styles.deleteButton}
+                      onClick={() => deleteLibraryCard(card.id)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </article>
+              ))
+            )}
+          </div>
+        </>
+      ),
+    });
+  }
+
+  function renderCollapsibleSection({
+    id,
+    title,
+    meta = "",
+    defaultOpen = false,
+    children,
+    style = {},
+    bodyStyle = {},
+  }) {
+    const isOpen = Boolean(openSections[id] ?? defaultOpen);
+
+    return (
+      <section style={{ ...styles.collapsibleSection, ...style }}>
+        <button
+          type="button"
+          style={styles.collapsibleHeader}
+          onClick={() =>
+            setOpenSections((sections) => ({
+              ...sections,
+              [id]: !isOpen,
+            }))
+          }
+          aria-expanded={isOpen}
+        >
+          <span style={styles.collapsibleTitle}>{title}</span>
+          <span style={styles.collapsibleMeta}>
+            {meta}
+            <span style={styles.collapsibleChevron}>{isOpen ? "▲" : "▼"}</span>
+          </span>
+        </button>
+        {isOpen && <div style={{ ...styles.collapsibleBody, ...bodyStyle }}>{children}</div>}
       </section>
     );
   }
@@ -3147,8 +3959,14 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
       (a, b) => new Date(b.savedAt).getTime() - new Date(a.savedAt).getTime()
     );
 
-    return (
-      <section style={styles.savedFilesSection}>
+    return renderCollapsibleSection({
+      id: `${sectionKey}-savedBooks`,
+      title: "Saved books",
+      meta: `${savedBooks.length}`,
+      defaultOpen: sectionKey !== "results",
+      style: styles.savedFilesSection,
+      children: (
+        <>
         <div style={styles.savedFilesTop}>
           <button
             type="button"
@@ -3164,12 +3982,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
             <span style={styles.savedArtSpark} />
           </button>
 
-          <div style={styles.savedFilesHeader}>
-            <h2 style={{ ...styles.sectionTitle, marginTop: 0 }}>
-              Reading / Saved List
-            </h2>
-            <span style={styles.fileCountBadge}>{savedBooks.length}</span>
-          </div>
+          <span style={styles.fileCountBadge}>{savedBooks.length}</span>
         </div>
 
         {saveStatus?.message && sectionKey === "home" && (
@@ -3241,8 +4054,9 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
             ))}
           </div>
         )}
-      </section>
-    );
+        </>
+      ),
+    });
   }
 
   function renderCompareRow(label, field) {
@@ -3310,226 +4124,109 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
     recognitionRef.current?.abort();
   }
 
-  const recentRequestEvents = getRecentEvents(geminiUsage?.requestEvents);
-  const geminiUsageCount = Number(geminiUsage?.count || 0);
-  const geminiDailyTotalTokens = Number(geminiUsage?.promptTokens || 0);
-  const geminiDailyTokenLimit = GEMINI_SCAN_DAILY_TOKEN_LIMIT;
-  const geminiMinuteRequests = recentRequestEvents.length;
-  const geminiUsagePercent = Math.min(
-    100,
-    Math.round((geminiUsageCount / GEMINI_DAILY_LIMIT) * 100)
-  );
-  const geminiRpmPercent = Math.min(
-    100,
-    Math.round((geminiMinuteRequests / GEMINI_SCAN_RPM_LIMIT) * 100)
-  );
-  const geminiTpmPercent = Math.min(
-    100,
-    Math.round((geminiDailyTotalTokens / geminiDailyTokenLimit) * 100)
-  );
-  const geminiRemaining = Math.max(0, GEMINI_DAILY_LIMIT - geminiUsageCount);
-  const geminiRpmRemaining = Math.max(
-    0,
-    GEMINI_SCAN_RPM_LIMIT - geminiMinuteRequests
-  );
-  const geminiTpmRemaining = Math.max(
-    0,
-    geminiDailyTokenLimit - geminiDailyTotalTokens
-  );
-  const geminiLiveStatus =
-    activeGeminiCalls > 0 ? "Running" : geminiUsage?.lastStatus || "Idle";
-  const geminiLastType = geminiUsage?.lastType || "No calls yet";
-  const geminiLastUpdated = getDisplayTime(geminiUsage?.lastUpdatedAt);
-  const geminiWarning =
-    geminiUsagePercent >= 90 || geminiRpmPercent >= 90 || geminiTpmPercent >= 90
-      ? "Close to a configured scan limit. Pause before making more scans."
-      : "Within the configured scan limits.";
-  const signedInName = user ? getUserDisplayName(user) : "";
-  const canOpenDeveloper = hasDeveloperAccess(user);
-  const homeGreeting = user
+  const syncUser = isSyncUser(user) ? user : null;
+  const signedInName = syncUser ? getUserDisplayName(syncUser) : "";
+  const canOpenDeveloper = hasDeveloperAccess(syncUser);
+  const homeGreeting = syncUser
     ? `Hi ${signedInName}, ${getTimeGreeting()}.`
     : "Welcome to Lumina.";
-  const homeGreetingDetail = user
+  const homeGreetingDetail = syncUser
     ? "Your saved books, filters, and preview files are ready here."
     : "Sign in to sync your saved books and filters across devices.";
 
-  const renderGeminiQuotaPanel = () => (
-    <div style={{ ...styles.devUsageMeter, margin: "0 0 16px" }}>
-      <button
-        type="button"
-        style={styles.devUsageToggle}
-        onClick={() => setDevQuotaOpen((isOpen) => !isOpen)}
-        aria-expanded={devQuotaOpen}
-      >
-        <span>Gemini scan quota</span>
-        <span>
-          {geminiUsageCount.toLocaleString()} requests · {geminiDailyTotalTokens.toLocaleString()}/
-          {geminiDailyTokenLimit.toLocaleString()} tokens {devQuotaOpen ? "▲" : "▼"}
-        </span>
-      </button>
-
-      {devQuotaOpen && (
-        <>
-          {[
-            {
-              label: "RPD",
-              value: `${geminiUsageCount}/${GEMINI_DAILY_LIMIT}`,
-              percent: geminiUsagePercent,
-            },
-            {
-              label: "RPM",
-              value: `${geminiMinuteRequests}/${GEMINI_SCAN_RPM_LIMIT}`,
-              percent: geminiRpmPercent,
-            },
-            {
-              label: "Tokens/day",
-              value: `${geminiDailyTotalTokens.toLocaleString()}/${geminiDailyTokenLimit.toLocaleString()}`,
-              percent: geminiTpmPercent,
-            },
-          ].map((meter) => (
-            <div key={meter.label} style={styles.devQuotaRow}>
-              <div style={styles.devQuotaLabelRow}>
-                <span>{meter.label}</span>
-                <span>{meter.value}</span>
-              </div>
-              <div style={styles.devUsageTrack} aria-hidden="true">
-                <span
-                  style={{
-                    ...styles.devUsageFill,
-                    width: `${meter.percent}%`,
-                    ...(meter.percent >= 90 ? styles.devUsageFillWarning : {}),
-                  }}
-                />
-              </div>
-            </div>
-          ))}
-          <p style={styles.devUsageText}>
-            {geminiWarning} Left: {geminiRemaining} day, {geminiRpmRemaining}
-            /min, {`${geminiTpmRemaining.toLocaleString()} tokens today`}.
-          </p>
-          <div style={styles.devLiveStatusRow}>
-            <span
-              style={{
-                ...styles.devStatusDot,
-                ...(geminiLiveStatus === "Running"
-                  ? styles.devStatusDotRunning
-                  : {}),
-                ...(geminiLiveStatus === "Failed"
-                  ? styles.devStatusDotFailed
-                  : {}),
-              }}
-            />
-            <span>
-              Live status: {geminiLiveStatus} · Last: {geminiLastType}
-              {geminiLastUpdated ? ` at ${geminiLastUpdated}` : ""}
-            </span>
-          </div>
-        </>
-      )}
-    </div>
-  );
-
-  function renderLibraryPage() {
+  function renderSavedBooksPage() {
     const folderTabs = ["All", ...folders];
     const libraryBooks = readingList.filter((book) => {
       if (activeFolder === "All") return true;
       return (bookFolders[getBookKey(book)] || "Want to read") === activeFolder;
     });
+    const recentScans = scanHistory.slice(0, 5);
 
     return (
-      <section style={styles.developerPanel}>
+      <section style={styles.pagePanel}>
         <div style={styles.authHeader}>
-          <h2 style={styles.authTitle}>Library</h2>
-          <p style={styles.authSubtitle}>Saved books, folders, previews, and details in one place.</p>
+          <h2 style={styles.authTitle}>Saved books</h2>
         </div>
-        <div style={styles.pageNav}>
-          {folderTabs.map((folder) => (
-            <button
-              key={folder}
-              type="button"
-              style={{
-                ...styles.navButton,
-                ...(activeFolder === folder ? styles.navButtonActive : {}),
-              }}
-              onClick={() => setActiveFolder(folder)}
-            >
-              {folder}
-            </button>
-          ))}
-        </div>
-        {libraryBooks.length === 0 ? (
-          <p style={styles.countText}>No saved books in this folder yet.</p>
-        ) : (
-          <div style={styles.grid}>
-            {libraryBooks.map((book, index) => renderBookCard(book, index, { prefix: "library" }))}
-          </div>
-        )}
-        {renderSavedFiles("library")}
-      </section>
-    );
-  }
 
-  function renderHistoryPage() {
-    return (
-      <section style={styles.developerPanel}>
-        <div style={styles.authHeader}>
-          <h2 style={styles.authTitle}>Scan History</h2>
-          <p style={styles.authSubtitle}>Review previous bookshelf scans and reopen detected books.</p>
-        </div>
-        {scanHistory.length === 0 ? (
-          <p style={styles.countText}>No scans yet. Scan a shelf to build history.</p>
-        ) : (
-          <div style={styles.savedFileList}>
-            {scanHistory.map((scan) => (
-              <div key={scan.id} style={styles.savedFileItem}>
-                <div style={styles.savedFileInfo}>
-                  <strong>{scan.imageName || "Bookshelf scan"}</strong>
-                  <p style={styles.savedFileMeta}>
-                    {getDisplayTime(scan.createdAt)} · {scan.bookCount} books · {scan.provider || "gemini"} · {Number(scan.totalTokens || 0).toLocaleString()} tokens
-                  </p>
-                </div>
-                <div style={styles.savedFileActions}>
+        {renderCollapsibleSection({
+          id: "libraryFolders",
+          title: "Folders",
+          meta: `${libraryBooks.length} books`,
+          defaultOpen: true,
+          children: (
+            <>
+              <div style={styles.pageNav}>
+                {folderTabs.map((folder) => (
                   <button
+                    key={folder}
                     type="button"
-                    style={styles.smallButton}
-                    onClick={() => {
-                      setBooks(Array.isArray(scan.books) ? scan.books : []);
-                      setCurrentPage("scan");
+                    style={{
+                      ...styles.navButton,
+                      ...(activeFolder === folder ? styles.navButtonActive : {}),
                     }}
+                    onClick={() => setActiveFolder(folder)}
                   >
-                    Reopen
+                    {folder}
                   </button>
-                  <button
-                    type="button"
-                    style={styles.deleteButton}
-                    onClick={() => setScanHistory((history) => history.filter((item) => item.id !== scan.id))}
-                  >
-                    Delete
-                  </button>
-                </div>
+                ))}
               </div>
-            ))}
-          </div>
-        )}
-      </section>
-    );
-  }
+              {libraryBooks.length === 0 ? (
+                <p style={styles.countText}>No saved books in this folder yet.</p>
+              ) : (
+                <div style={styles.grid}>
+                  {libraryBooks.map((book, index) =>
+                    renderBookCard(book, index, { prefix: "library" })
+                  )}
+                </div>
+              )}
+            </>
+          ),
+        })}
 
-  function renderLaunchReadiness() {
-    return (
-      <section style={styles.developerPanel}>
-        <div style={styles.authHeader}>
-          <h2 style={styles.authTitle}>Launch Readiness</h2>
-          <p style={styles.authSubtitle}>Google Play basics to finish before public release.</p>
-        </div>
-        <div style={styles.developerStatsGrid}>
-          {LAUNCH_READINESS_ITEMS.map((item) => (
-            <div key={item} style={styles.developerStatCard}>
-              <span style={styles.developerStatLabel}>Checklist</span>
-              <strong style={styles.developerStatValueSmall}>{item}</strong>
-            </div>
-          ))}
-        </div>
+        {renderSavedFiles("library")}
+
+        {renderCollapsibleSection({
+          id: "scanHistory",
+          title: "History",
+          meta: `${recentScans.length}`,
+          defaultOpen: false,
+          children:
+            recentScans.length === 0 ? (
+              <p style={styles.countText}>No scans yet. Scan a shelf to build history.</p>
+            ) : (
+              <div style={styles.savedFileList}>
+                {recentScans.map((scan) => (
+                  <div key={scan.id} style={styles.savedFileItem}>
+                    <div style={styles.savedFileInfo}>
+                      <strong>{scan.imageName || "Bookshelf scan"}</strong>
+                      <p style={styles.savedFileMeta}>
+                        {getDisplayTime(scan.createdAt)} · {scan.bookCount} books
+                      </p>
+                    </div>
+                    <div style={styles.savedFileActions}>
+                      <button
+                        type="button"
+                        style={styles.smallButton}
+                        onClick={() => {
+                          setBooks(Array.isArray(scan.books) ? scan.books : []);
+                          setCurrentPage("scan");
+                        }}
+                      >
+                        Reopen
+                      </button>
+                      <button
+                        type="button"
+                        style={styles.deleteButton}
+                        onClick={() => setScanHistory((history) => history.filter((item) => item.id !== scan.id))}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ),
+        })}
       </section>
     );
   }
@@ -3538,31 +4235,38 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
     return (
       <>
         {renderLoginPage()}
-        {user && renderLaunchReadiness()}
+        {renderLibraryCards()}
         {canOpenDeveloper && renderDeveloperPage()}
       </>
     );
   }
 
-  const renderDeveloperPage = () => (
-    <section style={styles.developerPanel}>
-      <div style={styles.authHeader}>
-        <h2 style={styles.authTitle}>Developer</h2>
-        <p style={styles.authSubtitle}>
-          Temporary developer page for Firebase auth stats and Gemini usage.
-        </p>
-      </div>
-
-      <div style={styles.developerLinkRow}>
-        <a
-          style={styles.developerLinkButton}
-          href={firestoreConsoleUrl}
-          target="_blank"
-          rel="noreferrer"
-        >
-          Open Firebase DB
-        </a>
-      </div>
+  const renderDeveloperPage = () =>
+    renderCollapsibleSection({
+      id: "developer",
+      title: "Developer",
+      meta: developerStatsStatus ? "Stats" : "",
+      style: styles.pagePanel,
+      children: (
+        <>
+          <div style={styles.developerLinkRow}>
+            <a
+              style={styles.developerLinkButton}
+              href={firestoreConsoleUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Firebase Console
+            </a>
+            <a
+              style={styles.developerLinkButton}
+              href={firebaseAuthConsoleUrl}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Firebase Auth
+            </a>
+          </div>
 
       <div style={styles.developerStatsGrid}>
         <div style={styles.developerStatCard}>
@@ -3611,6 +4315,23 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           </strong>
         </div>
         <div style={styles.developerStatCard}>
+          <span style={styles.developerStatLabel}>Tokens by IP</span>
+          <div style={styles.developerIpList}>
+            {developerIpUsage.length === 0 ? (
+              <strong style={styles.developerStatValueSmall}>No IP usage yet</strong>
+            ) : (
+              developerIpUsage.map((usage) => (
+                <div key={usage.ipAddress} style={styles.developerIpRow}>
+                  <strong>{usage.ipAddress}</strong>
+                  <span>
+                    {usage.totalTokens.toLocaleString()} tokens · {usage.apiCalls.toLocaleString()} calls
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+        <div style={styles.developerStatCard}>
           <span style={styles.developerStatLabel}>Registered users</span>
           <strong style={styles.developerStatValue}>
             {developerStats.registeredUsers.toLocaleString()}
@@ -3643,13 +4364,9 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           </strong>
         </div>
       </div>
-      {developerStatsStatus && (
-        <p style={styles.authNotice}>{developerStatsStatus}</p>
-      )}
-
-      {renderGeminiQuotaPanel()}
-    </section>
-  );
+        </>
+      ),
+    });
 
   return (
     <div style={styles.page}>
@@ -3731,8 +4448,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
       <nav style={styles.pageNav} aria-label="App pages">
         {[
           ["scan", "Scan"],
-          ["library", "Library"],
-          ["history", "History"],
+          ["saved", "Saved books"],
           ["account", "Account"],
         ].map(([pageId, label]) => (
           <button
@@ -3747,7 +4463,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
             {label}
           </button>
         ))}
-        {user && (
+        {syncUser && (
           <button type="button" style={styles.navButton} onClick={handleSignOut}>
             Sign Out
           </button>
@@ -3755,8 +4471,7 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
       </nav>
 
       {currentPage === "account" && renderAccountPage()}
-      {currentPage === "library" && renderLibraryPage()}
-      {currentPage === "history" && renderHistoryPage()}
+      {currentPage === "saved" && renderSavedBooksPage()}
 
       {currentPage === "scan" && (
         <>
@@ -3766,7 +4481,13 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
       </section>
 
       <div style={styles.uploadBox}>
-        <label style={styles.cameraButton}>
+        <label
+          style={{
+            ...styles.cameraButton,
+            ...(!isFirebaseConfigured ? styles.scanButtonNeedsAuth : {}),
+          }}
+          onClick={handleScanPickerClick}
+        >
           📷 Take Photo
           <input
             type="file"
@@ -3777,7 +4498,13 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
           />
         </label>
 
-        <label style={styles.galleryButton}>
+        <label
+          style={{
+            ...styles.galleryButton,
+            ...(!isFirebaseConfigured ? styles.scanButtonNeedsAuth : {}),
+          }}
+          onClick={handleScanPickerClick}
+        >
           🖼️ Pick from Gallery
           <input
             type="file"
@@ -3819,39 +4546,44 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
 
           {answer && <div style={styles.answer}>🤖 {answer}</div>}
 
-          <h2 style={styles.sectionTitle}>🏆 Top Picks</h2>
+          {renderCollapsibleSection({
+            id: "topPicks",
+            title: "Top picks",
+            meta: `${topBooks.length}`,
+            defaultOpen: true,
+            children:
+              topBooks.length === 0 ? (
+                <p style={styles.error}>No top picks match your search.</p>
+              ) : (
+                <div style={styles.grid}>
+                  {topBooks.map((book, index) =>
+                    renderBookCard(book, index, { prefix: "top", topPick: true })
+                  )}
+                </div>
+              ),
+          })}
 
-          {topBooks.length === 0 ? (
-            <p style={styles.error}>No top picks match your search.</p>
-          ) : (
-            <div style={styles.grid}>
-              {topBooks.map((book, index) =>
-                renderBookCard(book, index, { prefix: "top", topPick: true })
-              )}
-            </div>
-          )}
-
-          <h2 style={{ ...styles.sectionTitle, ...styles.detectedSectionTitle }}>
-            📖 Detected Books
-          </h2>
-
-          <p style={styles.countText}>
-            Showing {detectedBooks.length} books
-          </p>
-
-          <div style={styles.grid}>
-            {detectedBooks.length === 0 ? (
-              <p style={styles.error}>
-                {filteredBooks.length === 0
-                  ? "No matching books found. Try another word."
-                  : "All matching books are already shown in Top Picks."}
-              </p>
-            ) : (
-              detectedBooks.map((book, index) =>
-                renderBookCard(book, index, { prefix: "detected" })
-              )
-            )}
-          </div>
+          {renderCollapsibleSection({
+            id: "detectedBooks",
+            title: "Detected books",
+            meta: `${detectedBooks.length}`,
+            defaultOpen: true,
+            children: (
+              <div style={styles.grid}>
+                {detectedBooks.length === 0 ? (
+                  <p style={styles.error}>
+                    {filteredBooks.length === 0
+                      ? "No matching books found. Try another word."
+                      : "All matching books are already shown in Top Picks."}
+                  </p>
+                ) : (
+                  detectedBooks.map((book, index) =>
+                    renderBookCard(book, index, { prefix: "detected" })
+                  )
+                )}
+              </div>
+            ),
+          })}
 
           {renderSavedFiles("results")}
         </>
@@ -3928,16 +4660,18 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                   </div>
                 </div>
 
-                <div style={styles.detailBox}>
-                  <p>
-                    <b>👤 Author:</b> {selectedBook.author}
-                  </p>
-                  <p>
-                    <b>✨ About the Author:</b>
-                    <br />
-                    {selectedBook.authorBio || "Author information unavailable."}
-                  </p>
-                </div>
+                {renderCollapsibleSection({
+                  id: "detailAuthor",
+                  title: "Author",
+                  meta: selectedBook.author,
+                  defaultOpen: true,
+                  children: (
+                    <p style={styles.detailText}>
+                      {selectedBook.authorBio || "Author information unavailable."}
+                    </p>
+                  ),
+                  style: styles.detailCollapse,
+                })}
 
                 <div style={styles.detailGrid}>
                   <div style={styles.detailMiniCard}>
@@ -3981,31 +4715,32 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                   </div>
                 </div>
 
-                <div style={styles.detailBox}>
-                  <p>
-                    <b>💡 Why read it?</b>
-                    <br />
-                    {selectedBook.whyRead}
-                  </p>
-
-                  <p>
-                    <b>📖 Summary:</b>
-                    <br />
-                    {selectedBook.summary}
-                  </p>
-
-                  <p>
-                    <b>🧭 Similar reads:</b>
-                    <br />
-                    Look for more {selectedBook.genre || "books"} with a {selectedBook.readingLevel || "similar"} reading level.
-                  </p>
-
-                  <p>
-                    <b>🛡️ Suitability note:</b>
-                    <br />
-                    {getContentGuidance(selectedBook)}
-                  </p>
-                </div>
+                {renderCollapsibleSection({
+                  id: "detailNotes",
+                  title: "Notes",
+                  meta: selectedBook.genre || "Book",
+                  defaultOpen: true,
+                  children: (
+                    <div style={styles.detailNoteGrid}>
+                      <p style={styles.detailText}>
+                        <b>Why read it?</b>
+                        <br />
+                        {selectedBook.whyRead}
+                      </p>
+                      <p style={styles.detailText}>
+                        <b>Summary</b>
+                        <br />
+                        {selectedBook.summary}
+                      </p>
+                      <p style={styles.detailText}>
+                        <b>Suitability</b>
+                        <br />
+                        {getContentGuidance(selectedBook)}
+                      </p>
+                    </div>
+                  ),
+                  style: styles.detailCollapse,
+                })}
 
                 {detailSaveStatus && (
                   <p style={styles.saveStatus}>{detailSaveStatus}</p>
@@ -4100,6 +4835,48 @@ Answer in a cheerful, helpful, short way. Recommend books only from the detected
                 onClick={() => setCompareOpen(false)}
               >
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selectedLibraryCard && (
+        <div style={styles.modal}>
+          <div style={styles.libraryCardModalContent}>
+            <div style={styles.previewHeader}>
+              <div>
+                <h2 style={styles.modalTitle}>{selectedLibraryCard.name}</h2>
+                <p style={styles.previewSubtitle}>Library card</p>
+              </div>
+
+              <button
+                style={styles.closeIconButton}
+                onClick={() => setSelectedLibraryCard(null)}
+                aria-label="Close library card"
+              >
+                X
+              </button>
+            </div>
+
+            {selectedLibraryCard.imageDataUrl ? (
+              <img
+                src={selectedLibraryCard.imageDataUrl}
+                alt={`${selectedLibraryCard.name} full library card`}
+                style={styles.libraryCardFullPhoto}
+              />
+            ) : (
+              <p style={styles.countText}>No card photo saved.</p>
+            )}
+
+            {renderBarcodeSvg(selectedLibraryCard.cardNumber)}
+
+            <div style={styles.previewActionRow}>
+              <button
+                style={{ ...styles.closeButton, marginTop: 0 }}
+                onClick={() => setSelectedLibraryCard(null)}
+              >
+                Done
               </button>
             </div>
           </div>
@@ -4204,8 +4981,10 @@ const styles = {
   page: {
     position: "relative",
     isolation: "isolate",
-    overflow: "hidden",
+    overflowX: "hidden",
     minHeight: "100vh",
+    width: "100%",
+    boxSizing: "border-box",
     maxWidth: "1000px",
     margin: "auto",
     padding: "clamp(14px, 4vw, 24px)",
@@ -4225,6 +5004,8 @@ const styles = {
     gap: "16px",
     alignItems: "center",
     flexWrap: "wrap",
+    minWidth: 0,
+    maxWidth: "100%",
     boxShadow: "0 24px 80px rgba(0, 0, 0, 0.36)",
     color: "#ffffff",
     border: "1px solid rgba(230, 234, 240, 0.12)",
@@ -4238,6 +5019,8 @@ const styles = {
     display: "flex",
     alignItems: "center",
     gap: "14px",
+    minWidth: 0,
+    maxWidth: "100%",
     padding: 0,
     background: "transparent",
     border: "none",
@@ -4328,6 +5111,8 @@ const styles = {
     fontSize: "14px",
     fontWeight: "650",
     flex: "0 0 auto",
+    maxWidth: "100%",
+    minWidth: 0,
   },
   agentDot: {
     width: "10px",
@@ -4362,6 +5147,7 @@ const styles = {
     gap: "14px",
     flexWrap: "wrap",
     margin: "24px 0",
+    minWidth: 0,
   },
   pageNav: {
     display: "flex",
@@ -4369,8 +5155,11 @@ const styles = {
     gap: "8px",
     flexWrap: "wrap",
     margin: "16px 0 6px",
+    minWidth: 0,
+    maxWidth: "100%",
   },
   navButton: {
+    minWidth: 0,
     minHeight: "36px",
     padding: "8px 12px",
     borderRadius: "8px",
@@ -4380,6 +5169,7 @@ const styles = {
     cursor: "pointer",
     fontWeight: "700",
     fontSize: "13px",
+    whiteSpace: "normal",
   },
   navButtonActive: {
     background: "rgba(50, 121, 249, 0.18)",
@@ -4387,7 +5177,8 @@ const styles = {
     color: "#d8e7ff",
   },
   cameraButton: {
-    flex: "1 1 150px",
+    flex: "1 1 min(100%, 150px)",
+    minWidth: 0,
     textAlign: "center",
     background: "#3279f9",
     color: "#ffffff",
@@ -4400,7 +5191,8 @@ const styles = {
     boxShadow: "0 12px 30px rgba(50, 121, 249, 0.28)",
   },
   galleryButton: {
-    flex: "1 1 180px",
+    flex: "1 1 min(100%, 180px)",
+    minWidth: 0,
     textAlign: "center",
     background: "rgba(33, 34, 38, 0.86)",
     color: "#e6eaf0",
@@ -4411,24 +5203,10 @@ const styles = {
     fontWeight: "650",
     transition: "background 0.2s",
   },
-  voiceButton: {
-    flex: "1 1 160px",
-    textAlign: "center",
-    background: "rgba(251, 188, 5, 0.12)",
-    color: "#fff4c2",
-    padding: "12px 20px",
-    borderRadius: "8px",
-    border: "1px solid rgba(251, 188, 5, 0.34)",
-    cursor: "pointer",
-    fontWeight: "650",
-    transition: "background 0.2s, box-shadow 0.2s",
-    boxShadow: "0 12px 30px rgba(251, 188, 5, 0.12)",
-  },
-  voiceButtonActive: {
-    background: "rgba(234, 67, 53, 0.2)",
-    color: "#fce8e6",
-    border: "1px solid rgba(234, 67, 53, 0.48)",
-    boxShadow: "0 0 0 4px rgba(234, 67, 53, 0.14)",
+  scanButtonNeedsAuth: {
+    opacity: 0.78,
+    border: "1px solid rgba(251, 188, 5, 0.36)",
+    boxShadow: "none",
   },
   voiceStatus: {
     margin: "10px 0 14px",
@@ -4457,12 +5235,55 @@ const styles = {
     gap: "12px",
     marginBottom: "12px",
   },
+  filterTitleButton: {
+    minHeight: "36px",
+    padding: "6px 8px",
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "8px",
+    border: "none",
+    background: "transparent",
+    color: "#f8f9fc",
+    cursor: "pointer",
+    textAlign: "left",
+  },
   filterTitle: {
     margin: 0,
     color: "#f8f9fc",
     fontSize: "18px",
     lineHeight: 1.2,
     fontWeight: "650",
+  },
+  filterCountBadge: {
+    minWidth: "24px",
+    height: "24px",
+    padding: "0 7px",
+    borderRadius: "999px",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "rgba(50, 121, 249, 0.18)",
+    color: "#d8e7ff",
+    border: "1px solid rgba(50, 121, 249, 0.32)",
+    fontSize: "12px",
+    fontWeight: "750",
+  },
+  filterChevron: {
+    color: "#9aa0a6",
+    fontSize: "11px",
+    fontWeight: "750",
+  },
+  filterHeaderActions: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    flex: "0 0 auto",
+  },
+  filterSummary: {
+    margin: "10px 0 0",
+    color: "#9aa0a6",
+    fontSize: "13px",
+    lineHeight: 1.35,
   },
   filterGrid: {
     display: "grid",
@@ -4599,14 +5420,231 @@ const styles = {
     fontSize: "13px",
     fontWeight: "650",
   },
-  developerPanel: {
-    margin: "24px 0",
+  libraryCardBody: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 280px), 1fr))",
+    gap: "16px",
+    alignItems: "start",
+    minWidth: 0,
+  },
+  libraryCardForm: {
+    display: "grid",
+    gap: "12px",
+  },
+  libraryCardActions: {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gap: "10px",
+    minWidth: 0,
+  },
+  libraryCardScanButton: {
+    minHeight: "42px",
+    boxSizing: "border-box",
+    alignItems: "center",
+    justifyContent: "center",
+    textAlign: "center",
+  },
+  libraryCardList: {
+    display: "grid",
+    gap: "12px",
+  },
+  walletAddHeader: {
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+    padding: "12px",
+    borderRadius: "8px",
+    background: "rgba(230, 234, 240, 0.05)",
+    border: "1px solid rgba(230, 234, 240, 0.1)",
+  },
+  walletAddIcon: {
+    width: "38px",
+    height: "38px",
+    borderRadius: "999px",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    background: "#3279f9",
+    color: "#ffffff",
+    fontSize: "24px",
+    fontWeight: "700",
+    flex: "0 0 auto",
+  },
+  walletAddTitle: {
+    margin: 0,
+    color: "#f8f9fc",
+    fontSize: "16px",
+    lineHeight: 1.2,
+  },
+  libraryCardTile: {
+    display: "grid",
+    gap: "10px",
+  },
+  libraryCardWalletButton: {
+    position: "relative",
+    minHeight: "154px",
+    width: "100%",
+    maxWidth: "100%",
+    boxSizing: "border-box",
     padding: "18px",
     borderRadius: "8px",
-    background: "rgba(33, 34, 38, 0.84)",
-    border: "1px solid rgba(230, 234, 240, 0.12)",
-    boxShadow: "0 18px 42px rgba(0, 0, 0, 0.18)",
+    background:
+      "linear-gradient(135deg, #202124 0%, #2a2d33 52%, #17191d 100%)",
+    border: "1px solid rgba(230, 234, 240, 0.14)",
+    boxShadow: "0 18px 38px rgba(0, 0, 0, 0.24)",
+    color: "#f8f9fc",
+    cursor: "pointer",
+    overflow: "hidden",
     textAlign: "left",
+  },
+  walletAccent: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    width: "8px",
+    background:
+      "linear-gradient(180deg, #4285f4, #34a853 38%, #fbbc05 70%, #ea4335)",
+  },
+  walletEyebrow: {
+    margin: "0 0 18px",
+    color: "#bdc1c6",
+    fontSize: "12px",
+    fontWeight: "750",
+    textTransform: "uppercase",
+    letterSpacing: 0,
+  },
+  walletMaskedNumber: {
+    margin: "18px 0 0",
+    color: "#e6eaf0",
+    fontSize: "15px",
+    fontWeight: "700",
+    fontFamily: "ui-monospace, Consolas, monospace",
+  },
+  walletTapHint: {
+    position: "absolute",
+    right: "14px",
+    bottom: "12px",
+    color: "#8ab4f8",
+    fontSize: "13px",
+    fontWeight: "750",
+  },
+  libraryCardTileActions: {
+    display: "flex",
+    gap: "8px",
+    flexWrap: "wrap",
+  },
+  libraryCardName: {
+    margin: 0,
+    color: "#f8f9fc",
+    fontSize: "22px",
+    lineHeight: 1.2,
+    overflowWrap: "anywhere",
+  },
+  libraryCardBarcode: {
+    display: "block",
+    width: "100%",
+    maxWidth: "100%",
+    height: "112px",
+    borderRadius: "8px",
+    border: "8px solid #ffffff",
+    background: "#ffffff",
+    boxSizing: "border-box",
+  },
+  libraryCardPhotoPreview: {
+    padding: "10px",
+    borderRadius: "8px",
+    background: "rgba(230, 234, 240, 0.05)",
+    border: "1px solid rgba(230, 234, 240, 0.1)",
+  },
+  libraryCardPhoto: {
+    display: "block",
+    width: "100%",
+    maxHeight: "240px",
+    objectFit: "contain",
+    borderRadius: "8px",
+    background: "#ffffff",
+    border: "1px solid rgba(230, 234, 240, 0.14)",
+    marginTop: "12px",
+  },
+  libraryCardModalContent: {
+    width: "min(94vw, 560px)",
+    maxWidth: "100%",
+    boxSizing: "border-box",
+    maxHeight: "90vh",
+    overflow: "auto",
+    background: "#202124",
+    borderRadius: "8px",
+    padding: "18px",
+    border: "1px solid #34373d",
+    boxShadow: "0 26px 70px rgba(0,0,0,0.45)",
+    color: "#e8eaed",
+    textAlign: "left",
+  },
+  libraryCardFullPhoto: {
+    display: "block",
+    width: "100%",
+    maxHeight: "52vh",
+    objectFit: "contain",
+    borderRadius: "8px",
+    background: "#ffffff",
+    border: "1px solid rgba(230, 234, 240, 0.16)",
+    marginBottom: "14px",
+  },
+  pagePanel: {
+    margin: "20px 0",
+    padding: "14px",
+    borderRadius: "8px",
+    background: "rgba(33, 34, 38, 0.72)",
+    border: "1px solid rgba(230, 234, 240, 0.1)",
+    boxShadow: "0 14px 32px rgba(0, 0, 0, 0.14)",
+    textAlign: "left",
+  },
+  collapsibleSection: {
+    margin: "14px 0",
+    borderRadius: "8px",
+    background: "rgba(24, 25, 29, 0.86)",
+    border: "1px solid rgba(230, 234, 240, 0.11)",
+    overflow: "hidden",
+    textAlign: "left",
+  },
+  collapsibleHeader: {
+    width: "100%",
+    minHeight: "48px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "12px",
+    padding: "12px 14px",
+    border: "none",
+    background: "rgba(230, 234, 240, 0.035)",
+    color: "#f8f9fc",
+    cursor: "pointer",
+    textAlign: "left",
+  },
+  collapsibleTitle: {
+    minWidth: 0,
+    color: "#f8f9fc",
+    fontSize: "16px",
+    fontWeight: "760",
+    overflowWrap: "anywhere",
+  },
+  collapsibleMeta: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: "8px",
+    color: "#9aa0a6",
+    fontSize: "12px",
+    fontWeight: "750",
+    whiteSpace: "nowrap",
+  },
+  collapsibleChevron: {
+    color: "#8ab4f8",
+    fontSize: "11px",
+  },
+  collapsibleBody: {
+    padding: "14px",
   },
   developerLinkRow: {
     display: "flex",
@@ -4659,89 +5697,32 @@ const styles = {
     lineHeight: 1.3,
     overflowWrap: "anywhere",
   },
-  devUsageMeter: {
-    margin: "-12px 0 16px",
-    padding: "8px 10px",
-    borderRadius: "8px",
-    border: "1px dashed rgba(251, 188, 5, 0.5)",
-    background: "rgba(251, 188, 5, 0.08)",
-    color: "#fdd663",
+  developerIpList: {
+    display: "grid",
+    gap: "8px",
   },
-  devUsageToggle: {
-    width: "100%",
-    display: "flex",
-    justifyContent: "space-between",
-    gap: "12px",
-    alignItems: "center",
-    padding: 0,
-    background: "transparent",
-    border: "none",
-    color: "#fdd663",
-    cursor: "pointer",
-    fontSize: "12px",
-    fontWeight: "700",
-    textAlign: "left",
-  },
-  devQuotaRow: {
-    marginTop: "6px",
-  },
-  devQuotaLabelRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    gap: "12px",
-    color: "#fff8d7",
-    fontSize: "11px",
-    fontWeight: "800",
-  },
-  devUsageTrack: {
-    position: "relative",
-    height: "5px",
-    marginTop: "4px",
-    overflow: "hidden",
-    borderRadius: "999px",
-    background: "rgba(255, 255, 255, 0.16)",
-  },
-  devUsageFill: {
-    display: "block",
-    height: "100%",
-    borderRadius: "999px",
-    background: "linear-gradient(90deg, #34a853, #fbbc05)",
-    transition: "width 0.2s ease",
-  },
-  devUsageFillWarning: {
-    background: "linear-gradient(90deg, #fbbc05, #ea4335)",
-  },
-  devUsageText: {
-    margin: "6px 0 0",
-    color: "#fbe7a0",
-    fontSize: "11px",
+  developerIpRow: {
+    display: "grid",
+    gap: "3px",
+    color: "#f8f9fc",
+    fontSize: "13px",
     lineHeight: 1.3,
+    overflowWrap: "anywhere",
   },
-  devLiveStatusRow: {
-    display: "flex",
-    alignItems: "center",
-    gap: "6px",
-    marginTop: "6px",
-    color: "#f8fafd",
-    fontSize: "11px",
-    fontWeight: "650",
-    lineHeight: 1.4,
+  detailCollapse: {
+    margin: "12px 0",
+    background: "#171717",
+    border: "1px solid #34373d",
   },
-  devStatusDot: {
-    width: "7px",
-    height: "7px",
-    borderRadius: "999px",
-    background: "#34a853",
-    boxShadow: "0 0 0 3px rgba(52, 168, 83, 0.14)",
-    flex: "0 0 auto",
+  detailText: {
+    margin: 0,
+    color: "#dfe4ea",
+    lineHeight: 1.5,
+    overflowWrap: "anywhere",
   },
-  devStatusDotRunning: {
-    background: "#fbbc05",
-    boxShadow: "0 0 0 3px rgba(251, 188, 5, 0.18)",
-  },
-  devStatusDotFailed: {
-    background: "#ea4335",
-    boxShadow: "0 0 0 3px rgba(234, 67, 53, 0.18)",
+  detailNoteGrid: {
+    display: "grid",
+    gap: "12px",
   },
   askButton: {
     background: "#34a853",
@@ -4774,17 +5755,6 @@ const styles = {
     gap: "10px",
     margin: "24px 0",
     flexWrap: "wrap",
-  },
-  search: {
-    flex: 1,
-    minWidth: "220px",
-    padding: "12px",
-    borderRadius: "8px",
-    border: "1px solid #3c4043",
-    fontSize: "16px",
-    background: "#202124",
-    color: "#e8eaed",
-    outlineColor: "#1a73e8",
   },
   filterComposer: {
     width: "100%",
@@ -4865,9 +5835,6 @@ const styles = {
     fontWeight: "650",
     clear: "both",
   },
-  detectedSectionTitle: {
-    marginTop: "56px",
-  },
   countText: {
     color: "#9aa0a6",
     fontWeight: "500",
@@ -4875,6 +5842,9 @@ const styles = {
   savedFilesSection: {
     margin: "24px 0",
     padding: "16px",
+    minWidth: 0,
+    maxWidth: "100%",
+    boxSizing: "border-box",
     borderRadius: "8px",
     background: "#202124",
     border: "1px solid #34373d",
@@ -4886,13 +5856,6 @@ const styles = {
     alignItems: "center",
     gap: "14px",
     marginBottom: "10px",
-  },
-  savedFilesHeader: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: "12px",
-    flex: 1,
   },
   savedFilesArt: {
     position: "relative",
@@ -4970,9 +5933,10 @@ const styles = {
   },
   savedFileItem: {
     display: "grid",
-    gridTemplateColumns: "minmax(0, 1fr) auto",
+    gridTemplateColumns: "minmax(0, 1fr) minmax(0, auto)",
     alignItems: "center",
     gap: "12px",
+    minWidth: 0,
     padding: "12px",
     borderRadius: "8px",
     background: "#171717",
@@ -4997,20 +5961,17 @@ const styles = {
   },
   savedFileActions: {
     display: "grid",
-    gridTemplateColumns: "repeat(2, minmax(92px, auto))",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
     gap: "8px",
     alignItems: "center",
-    justifyContent: "end",
-  },
-  savedActionSpacer: {
-    minWidth: "92px",
-    minHeight: "1px",
+    justifyContent: "stretch",
+    minWidth: 0,
   },
   noPreviewBadge: {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    minWidth: "132px",
+    minWidth: 0,
     padding: "8px 10px",
     borderRadius: "6px",
     border: "1px solid rgba(251, 188, 5, 0.28)",
@@ -5219,6 +6180,7 @@ const styles = {
   compareTable: {
     display: "grid",
     gap: "8px",
+    minWidth: 0,
   },
   compareTableScroll: {
     maxHeight: "min(54vh, 520px)",
@@ -5227,9 +6189,10 @@ const styles = {
   },
   compareRow: {
     display: "grid",
-    gridTemplateColumns: "100px repeat(2, minmax(0, 1fr))",
+    gridTemplateColumns: "minmax(72px, 100px) repeat(2, minmax(0, 1fr))",
     gap: "8px",
     alignItems: "stretch",
+    minWidth: 0,
   },
   compareLabel: {
     padding: "10px",
@@ -5265,6 +6228,7 @@ const styles = {
     justifyContent: "center",
     padding: "20px",
     overflowY: "auto",
+    overflowX: "hidden",
     zIndex: 1000,
   },
   modalContent: {
@@ -5273,6 +6237,7 @@ const styles = {
     borderRadius: "8px",
     maxWidth: "620px",
     width: "100%",
+    boxSizing: "border-box",
     boxShadow: "0 28px 70px rgba(0, 0, 0, 0.42)",
     color: "#bdc1c6",
   },
@@ -5282,6 +6247,7 @@ const styles = {
     borderRadius: "8px",
     maxWidth: "760px",
     width: "min(100%, 760px)",
+    boxSizing: "border-box",
     maxHeight: "88vh",
     boxShadow: "0 28px 70px rgba(0, 0, 0, 0.42)",
     color: "#bdc1c6",
@@ -5296,6 +6262,7 @@ const styles = {
     borderRadius: "8px",
     maxWidth: "900px",
     width: "100%",
+    boxSizing: "border-box",
     maxHeight: "92vh",
     boxShadow: "0 28px 70px rgba(0, 0, 0, 0.42)",
     color: "#bdc1c6",
@@ -5440,13 +6407,6 @@ const styles = {
     border: "1px solid #3c4043",
     cursor: "pointer",
     fontWeight: "600",
-  },
-  detailBox: {
-    background: "#171717",
-    borderRadius: "8px",
-    padding: "16px",
-    margin: "12px 0",
-    border: "1px solid #34373d",
   },
   detailGrid: {
     display: "grid",
